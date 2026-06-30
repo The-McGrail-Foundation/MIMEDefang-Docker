@@ -1,0 +1,24 @@
+# =============================================================================
+# mimedefang-filter.default
+#
+# Minimal pass-through filter – shipped inside the container image.
+# Mount your own filter at /etc/mail/mimedefang-filter to override.
+# =============================================================================
+use strict;
+use warnings;
+
+sub filter_begin {
+    # Nothing to do at message start
+}
+
+sub filter {
+    # Accept every MIME part without modification
+    return action_accept();
+}
+
+sub filter_end {
+    # Nothing to do at message end
+}
+
+# Required: return 1 to indicate successful load
+1;

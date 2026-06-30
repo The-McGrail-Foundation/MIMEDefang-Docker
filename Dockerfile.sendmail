@@ -1,0 +1,183 @@
+# =============================================================================
+# mimedefang/sendmail  –  three build targets
+#
+#   docker build --target ci   -t mimedefang/sendmail:ci   .    <- CI
+#   docker build --target prod -t mimedefang/sendmail:latest .  <- production image
+#   docker build               -t mimedefang/sendmail:latest .  <- same as prod (default)
+#
+# Build-time ARGs (override with --build-arg NAME=value):
+#
+#   BASE_IMAGE        Base OS image            (default: almalinux:9)
+#   MIMEDEFANG_VER    MIMEDefang release tag   (default: v3.7)
+#
+# Run-time ENV (set with -e NAME=value or env_file):
+#
+#   MAIL_DOMAIN       Primary mail domain      (default: example.com)
+#   MAIL_HOST         FQDN of this host        (default: mail.example.com)
+#   SMART_HOST        Relay / smart host       (optional)
+#   MAX_WORKERS       Multiplexor max workers  (default: 10)
+#   MIN_WORKERS       Multiplexor min workers  (default: 2)
+#   MAX_IDLE          Max idle workers         (default: 2)
+#   SPOOL_DIR         MIMEDefang spool dir     (default: /var/spool/MIMEDefang)
+#   LOG_LEVEL         Sendmail syslog level    (default: 9)
+#   SMTP_PORT         SMTP listen port         (default: 25)
+#   ENABLE_SUBMISSION Also listen on port 587  (default: no)
+#   TZ                Container timezone       (default: UTC)
+#
+# Volume mount points (prod):
+#   /etc/mail/mimedefang-filter   – your Perl filter (bind-mount to customise)
+#   /etc/mail/sendmail.mc         – optional full custom sendmail.mc
+#   /var/spool/MIMEDefang         – spool (persist across restarts)
+#   /var/spool/MD-Quarantine      – quarantine directory
+#   /etc/pki/tls/mimedefang       – TLS key + cert PEM files
+# =============================================================================
+
+ARG BASE_IMAGE=almalinux:9
+ARG MIMEDEFANG_VER=v3.7
+
+# ---------------------------------------------------------------------------
+# Stage: base-pkgs  –  shared package layer, referenced by both ci and prod
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS base-pkgs
+
+# Packages needed at runtime in every target
+RUN dnf -y update && \
+    dnf config-manager --set-enabled crb && \
+    dnf -y install epel-release && \
+    dnf -y install \
+        sendmail sendmail-cf m4 \
+        postfix \
+        perl \
+        perl-MIME-tools \
+        perl-MailTools \
+        perl-Digest-SHA \
+        perl-IO-Socket-SSL \
+        perl-JSON \
+        perl-libwww-perl \
+        perl-HTML-Parser \
+        tzdata procps-ng rsyslog nc \
+        perl-AnyEvent \
+        perl-Net-DNS \
+        perl-Mail-DKIM \
+        perl-Mail-SPF \
+        perl-Archive-Zip \
+        perl-Unix-Syslog \
+        spamassassin \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+# ---------------------------------------------------------------------------
+# Stage: devel-pkgs  –  extends base with everything needed to compile
+# ---------------------------------------------------------------------------
+FROM base-pkgs AS devel-pkgs
+
+RUN dnf -y install \
+        gcc make autoconf automake \
+        rpm-build \
+        sendmail-devel \
+        perl-devel \
+        perl-CPAN \
+        perl-Test-Class \
+        perl-Test-Most \
+        perl-File-Find-Rule \
+        git tar gzip \
+    && dnf clean all && rm -rf /var/cache/dnf
+
+# ---------------------------------------------------------------------------
+# Stage: ci  –  full build+test environment (devel files KEPT)
+#
+# The CI workflow bind-mounts the repo root to /tests and calls
+#   sh t/dockerSendmail.sh
+# which runs ./configure, make, make test inside the container.
+# ---------------------------------------------------------------------------
+FROM devel-pkgs AS ci
+
+LABEL org.opencontainers.image.title="mimedefang/sendmail (CI)" \
+      org.opencontainers.image.description="MIMEDefang + sendmail – CI/CD build & test image" \
+      org.opencontainers.image.source="https://github.com/The-McGrail-Foundation/MIMEDefang"
+
+# Create the defang user and spool dirs so tests that start the daemon work
+RUN useradd -r -s /sbin/nologin -d /var/spool/MIMEDefang defang 2>/dev/null || true && \
+    mkdir -p /var/spool/MIMEDefang /var/spool/MD-Quarantine && \
+    chown defang:defang /var/spool/MIMEDefang /var/spool/MD-Quarantine && \
+    chmod 700 /var/spool/MIMEDefang /var/spool/MD-Quarantine
+
+WORKDIR /tests
+
+# Default command mirrors docker-compose-sendmail.yml
+CMD ["sh", "t/dockerSendmail.sh"]
+
+# ---------------------------------------------------------------------------
+# Stage: builder  –  compile a release tarball for the production image
+# ---------------------------------------------------------------------------
+FROM devel-pkgs AS builder
+
+ARG MIMEDEFANG_VER
+
+WORKDIR /build
+
+RUN git clone --depth 1 --branch ${MIMEDEFANG_VER} \
+        https://github.com/The-McGrail-Foundation/MIMEDefang.git . && \
+    autoreconf -fvi && \
+    ./configure \
+        --sysconfdir=/etc \
+        --with-confsubdir=mail \
+        --with-spooldir=/var/spool/MIMEDefang \
+        --with-quarantinedir=/var/spool/MD-Quarantine && \
+    make -j"$(nproc)" && \
+    make install DESTDIR=/install
+
+# ---------------------------------------------------------------------------
+# Stage: prod  –  lean runtime image (no compiler, no headers)
+# ---------------------------------------------------------------------------
+FROM base-pkgs AS prod
+
+ARG MIMEDEFANG_VER
+LABEL org.opencontainers.image.title="mimedefang/sendmail" \
+      org.opencontainers.image.description="MIMEDefang + Sendmail – production image" \
+      org.opencontainers.image.version="${MIMEDEFANG_VER}" \
+      org.opencontainers.image.source="https://github.com/The-McGrail-Foundation/MIMEDefang" \
+      org.opencontainers.image.licenses="GPL-2.0"
+
+COPY --from=builder /install/ /
+
+ENV MAIL_DOMAIN="example.com" \
+    MAIL_HOST="mail.example.com" \
+    SMART_HOST="" \
+    MAX_WORKERS="10" \
+    MIN_WORKERS="2" \
+    MAX_IDLE="2" \
+    SPOOL_DIR="/var/spool/MIMEDefang" \
+    LOG_LEVEL="9" \
+    SMTP_PORT="25" \
+    ENABLE_SUBMISSION="no" \
+    TZ="UTC"
+
+RUN useradd -r -s /sbin/nologin -d /var/spool/MIMEDefang defang 2>/dev/null || true && \
+    mkdir -p \
+        /var/spool/MIMEDefang \
+        /var/spool/MD-Quarantine \
+        /etc/pki/tls/mimedefang \
+        /run/mimedefang && \
+    chown defang:defang \
+        /var/spool/MIMEDefang \
+        /var/spool/MD-Quarantine \
+        /run/mimedefang && \
+    chmod 700 /var/spool/MIMEDefang /var/spool/MD-Quarantine
+
+COPY --chmod=644 docker/mimedefang-filter.default /etc/mail/mimedefang-filter.default
+COPY --chmod=755 docker/entrypoint-sendmail.sh     /entrypoint.sh
+
+VOLUME ["/etc/mail/mimedefang-filter", \
+        "/var/spool/MIMEDefang", \
+        "/var/spool/MD-Quarantine", \
+        "/etc/pki/tls/mimedefang"]
+
+EXPOSE 25 587
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD echo QUIT | nc -w3 127.0.0.1 ${SMTP_PORT} | grep -q "220" || exit 1
+
+ENTRYPOINT ["/entrypoint.sh"]
+
+# Make prod the default target
+FROM prod
