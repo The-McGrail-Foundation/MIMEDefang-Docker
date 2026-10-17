@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1
+#
+# Image for mimedefang-gliclass-server (Mail::MIMEDefang::ML::GLiClass backend).
+#
+# Build (from this directory):
+#   docker build -f Dockerfile.gliclass -t mimedefang-gliclass-server .
+#
+# The server and its requirements are cloned from the MIMEDefang GitHub
+# repository (script/ml-servers/). Pick the git tag or branch with
+# MIMEDEFANG_VER (default: master, as no release ships them yet):
+#   docker build -f Dockerfile.gliclass -t mimedefang-gliclass-server \
+#       --build-arg MIMEDEFANG_VER=v3.8 .
+#
+# Bake the model into the image (no download at first start):
+#   docker build -f Dockerfile.gliclass -t mimedefang-gliclass-server \
+#       --build-arg PRELOAD_MODEL=1 .
+#
+# GPU: build with --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu124
+# (or your CUDA version) and run with --gpus all and
+# -e GLICLASS_DEVICE=cuda:0.
+#
+# Run:
+#   docker run -d --name gliclass -p 127.0.0.1:8688:8688 \
+#       -v mdml-hf:/var/lib/MIMEDefang/ml/huggingface \
+#       mimedefang-gliclass-server
+#
+# The server has no authentication: publish the port on 127.0.0.1 or
+# firewall it so only the MIMEDefang hosts can reach it.
+
+ARG PYTHON_VERSION=3.12
+# git tag/branch of MIMEDefang to take the server from; set to v3.8 once released
+ARG MIMEDEFANG_VER=master
+
+# Stage: source  –  fetch the server sources from GitHub
+FROM python:${PYTHON_VERSION}-slim AS source
+ARG MIMEDEFANG_VER
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch "${MIMEDEFANG_VER}" \
+      https://github.com/The-McGrail-Foundation/MIMEDefang.git /src
+
+# Stage: runtime
+FROM python:${PYTHON_VERSION}-slim
+
+ARG MIMEDEFANG_VER
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+ARG GLICLASS_MODEL=knowledgator/gliclass-modern-base-v2.0
+ARG PRELOAD_MODEL=0
+
+LABEL org.opencontainers.image.title="mimedefang-gliclass-server" \
+      org.opencontainers.image.version="${MIMEDEFANG_VER}" \
+      org.opencontainers.image.source="https://github.com/The-McGrail-Foundation/MIMEDefang"
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/var/lib/MIMEDefang/ml/huggingface \
+    GLICLASS_HOST=0.0.0.0 \
+    GLICLASS_PORT=8688 \
+    GLICLASS_THREADS=8 \
+    GLICLASS_TORCH_THREADS=2 \
+    GLICLASS_MODEL=${GLICLASS_MODEL} \
+    GLICLASS_DEVICE=cpu \
+    GLICLASS_MAX_LENGTH=4096 \
+    GLICLASS_MIN_CONFIDENCE=0.55
+
+RUN groupadd --system defang \
+ && useradd --system --gid defang --home-dir /var/lib/MIMEDefang defang \
+ && install -d -o defang -g defang /var/lib/MIMEDefang/ml/huggingface
+
+WORKDIR /app
+
+# torch first, from the chosen wheel index (CPU by default: avoids the
+# multi-GB CUDA build), then the server's own requirements.
+RUN pip install torch --index-url "${TORCH_INDEX}"
+COPY --from=source /src/script/ml-servers/requirements-gliclass.txt .
+RUN pip install -r requirements-gliclass.txt
+
+COPY --from=source --chmod=0755 /src/script/ml-servers/mimedefang-gliclass-server \
+     /usr/local/bin/mimedefang-gliclass-server
+
+USER defang
+
+RUN if [ "${PRELOAD_MODEL}" = "1" ]; then \
+      python -c "from huggingface_hub import snapshot_download; snapshot_download('${GLICLASS_MODEL}')"; \
+    fi
+
+VOLUME /var/lib/MIMEDefang/ml/huggingface
+EXPOSE 8688
+
+# The model is loaded before the server listens, so allow a long start period.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ['GLICLASS_PORT'], timeout=4)"
+
+# Shell form of exec so the GLICLASS_* variables can be overridden at run time.
+# Never use --daemon in a container: it would detach from PID 1.
+ENTRYPOINT ["/bin/sh", "-c", "exec mimedefang-gliclass-server \
+  --host \"$GLICLASS_HOST\" --port \"$GLICLASS_PORT\" \
+  --threads \"$GLICLASS_THREADS\" --torch-threads \"$GLICLASS_TORCH_THREADS\" \
+  --model \"$GLICLASS_MODEL\" --device \"$GLICLASS_DEVICE\" \
+  --max-length \"$GLICLASS_MAX_LENGTH\" --min-confidence \"$GLICLASS_MIN_CONFIDENCE\" \
+  \"$@\"", "mimedefang-gliclass-server"]

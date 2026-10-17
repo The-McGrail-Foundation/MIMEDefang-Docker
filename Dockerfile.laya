@@ -1,0 +1,99 @@
+# syntax=docker/dockerfile:1
+#
+# Image for mimedefang-laya-server (Mail::MIMEDefang::ML::Laya backend).
+#
+# Build (from this directory):
+#   docker build -f Dockerfile.laya -t mimedefang-laya-server .
+#
+# The server and its requirements are cloned from the MIMEDefang GitHub
+# repository (script/ml-servers/). Pick the git tag or branch with
+# MIMEDEFANG_VER (default: master, as no release ships them yet):
+#   docker build -f Dockerfile.laya -t mimedefang-laya-server \
+#       --build-arg MIMEDEFANG_VER=v3.8 .
+#
+# Bake the stock checkpoints into the image (no download at first start):
+#   docker build -f Dockerfile.laya -t mimedefang-laya-server \
+#       --build-arg PRELOAD_MODEL=1 .
+#
+# GPU: build with --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu124
+# (or your CUDA version) and run with --gpus all. The laya library picks
+# the device itself.
+#
+# Run:
+#   docker run -d --name laya -p 127.0.0.1:8687:8687 \
+#       -v mdml-hf:/var/lib/MIMEDefang/ml/huggingface \
+#       mimedefang-laya-server
+#
+# The server has no authentication: publish the port on 127.0.0.1 or
+# firewall it so only the MIMEDefang hosts can reach it.
+
+ARG PYTHON_VERSION=3.12
+# git tag/branch of MIMEDefang to take the server from; set to v3.8 once released
+ARG MIMEDEFANG_VER=master
+
+# Stage: source  –  fetch the server sources from GitHub
+FROM python:${PYTHON_VERSION}-slim AS source
+ARG MIMEDEFANG_VER
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch "${MIMEDEFANG_VER}" \
+      https://github.com/The-McGrail-Foundation/MIMEDefang.git /src
+
+# Stage: runtime
+FROM python:${PYTHON_VERSION}-slim
+
+ARG MIMEDEFANG_VER
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
+ARG PRELOAD_MODEL=0
+
+LABEL org.opencontainers.image.title="mimedefang-laya-server" \
+      org.opencontainers.image.version="${MIMEDEFANG_VER}" \
+      org.opencontainers.image.source="https://github.com/The-McGrail-Foundation/MIMEDefang"
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/var/lib/MIMEDefang/ml/huggingface \
+    LAYA_HOST=0.0.0.0 \
+    LAYA_PORT=8687 \
+    LAYA_THREADS=8 \
+    LAYA_TORCH_THREADS=2 \
+    LAYA_MIN_CONFIDENCE=0.55
+
+RUN groupadd --system defang \
+ && useradd --system --gid defang --home-dir /var/lib/MIMEDefang defang \
+ && install -d -o defang -g defang /var/lib/MIMEDefang/ml/huggingface
+
+WORKDIR /app
+
+# torch first, from the chosen wheel index (CPU by default: avoids the
+# multi-GB CUDA build), then the server's own requirements.
+RUN pip install torch --index-url "${TORCH_INDEX}"
+COPY --from=source /src/script/ml-servers/requirements-laya.txt .
+RUN pip install -r requirements-laya.txt
+
+COPY --from=source --chmod=0755 /src/script/ml-servers/mimedefang-laya-server \
+     /usr/local/bin/mimedefang-laya-server
+
+USER defang
+
+RUN if [ "${PRELOAD_MODEL}" = "1" ]; then \
+      python -c "from laya import Router; Router(preload=True)"; \
+    fi
+
+VOLUME /var/lib/MIMEDefang/ml/huggingface
+EXPOSE 8687
+
+# The router loads its checkpoints before the server listens, so allow a
+# long start period.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+  CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ['LAYA_PORT'], timeout=4)"
+
+# Extra options go after the image name, e.g.
+#   docker run ... mimedefang-laya-server --preload english,multilingual
+# Never use --daemon in a container: it would detach from PID 1.
+ENTRYPOINT ["/bin/sh", "-c", "exec mimedefang-laya-server \
+  --host \"$LAYA_HOST\" --port \"$LAYA_PORT\" \
+  --threads \"$LAYA_THREADS\" --torch-threads \"$LAYA_TORCH_THREADS\" \
+  --min-confidence \"$LAYA_MIN_CONFIDENCE\" \"$@\"", "mimedefang-laya-server"]
