@@ -33,7 +33,7 @@
 # =============================================================================
 
 ARG BASE_IMAGE=almalinux:9
-ARG MIMEDEFANG_VER=v3.7
+ARG MIMEDEFANG_VER=v3.7.1
 
 # ---------------------------------------------------------------------------
 # Stage: base-pkgs  –  runtime packages shared by ci and prod
