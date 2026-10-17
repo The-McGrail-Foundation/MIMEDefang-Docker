@@ -85,9 +85,11 @@ RUN if [ "${PRELOAD_MODEL}" = "1" ]; then \
 VOLUME /var/lib/MIMEDefang/ml/huggingface
 EXPOSE 8687
 
-# The router loads its checkpoints before the server listens, so allow a
-# long start period.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
+# The router loads its checkpoints before the server listens, and on the
+# first start it downloads all of them (several GB), which can take well
+# over five minutes.  Failed checks don't count during the start period and
+# the first success ends it, so a long one costs nothing once cached.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=900s --retries=3 \
   CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.environ['LAYA_PORT'], timeout=4)"
 
 # Extra options go after the image name, e.g.
