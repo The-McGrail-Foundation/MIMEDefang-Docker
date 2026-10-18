@@ -15,6 +15,21 @@
 #   docker build -f Dockerfile.gliclass -t mimedefang-gliclass-server \
 #       --build-arg PRELOAD_MODEL=1 .
 #
+# The default model is English. For mail in other languages pick a
+# multilingual checkpoint at run time, and set GLICLASS_MAX_LENGTH to its
+# token limit (512 for gliclass-multilang-mini):
+#   docker run -d --name gliclass -p 127.0.0.1:8688:8688 \
+#       -e GLICLASS_MODEL=knowledgator/gliclass-multilang-mini \
+#       -e GLICLASS_MAX_LENGTH=512 \
+#       -v mdml-hf:/var/lib/MIMEDefang/ml/huggingface \
+#       mimedefang-gliclass-server
+# or bake it in (GLICLASS_MAX_LENGTH is also a build arg):
+#   docker build -f Dockerfile.gliclass -t mimedefang-gliclass-server \
+#       --build-arg GLICLASS_MODEL=knowledgator/gliclass-multilang-mini \
+#       --build-arg GLICLASS_MAX_LENGTH=512 --build-arg PRELOAD_MODEL=1 .
+# Checkpoints whose model card loads the tokenizer with add_prefix_space=True
+# (gliclass-x-base) also need -e GLICLASS_ADD_PREFIX_SPACE=1.
+#
 # GPU: build with --build-arg TORCH_INDEX=https://download.pytorch.org/whl/cu124
 # (or your CUDA version) and run with --gpus all and
 # -e GLICLASS_DEVICE=cuda:0.
@@ -46,6 +61,7 @@ FROM python:${PYTHON_VERSION}-slim
 ARG MIMEDEFANG_VER
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
 ARG GLICLASS_MODEL=knowledgator/gliclass-modern-base-v2.0
+ARG GLICLASS_MAX_LENGTH=4096
 ARG PRELOAD_MODEL=0
 
 LABEL org.opencontainers.image.title="mimedefang-gliclass-server" \
@@ -62,8 +78,9 @@ ENV PYTHONUNBUFFERED=1 \
     GLICLASS_TORCH_THREADS=2 \
     GLICLASS_MODEL=${GLICLASS_MODEL} \
     GLICLASS_DEVICE=cpu \
-    GLICLASS_MAX_LENGTH=4096 \
-    GLICLASS_MIN_CONFIDENCE=0.55
+    GLICLASS_MAX_LENGTH=${GLICLASS_MAX_LENGTH} \
+    GLICLASS_MIN_CONFIDENCE=0.55 \
+    GLICLASS_ADD_PREFIX_SPACE=0
 
 RUN groupadd --system defang \
  && useradd --system --gid defang --home-dir /var/lib/MIMEDefang defang \
@@ -95,7 +112,8 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=180s --retries=3 \
 
 # Shell form of exec so the GLICLASS_* variables can be overridden at run time.
 # Never use --daemon in a container: it would detach from PID 1.
-ENTRYPOINT ["/bin/sh", "-c", "exec mimedefang-gliclass-server \
+ENTRYPOINT ["/bin/sh", "-c", "if [ \"$GLICLASS_ADD_PREFIX_SPACE\" = 1 ]; then set -- --add-prefix-space \"$@\"; fi; \
+  exec mimedefang-gliclass-server \
   --host \"$GLICLASS_HOST\" --port \"$GLICLASS_PORT\" \
   --threads \"$GLICLASS_THREADS\" --torch-threads \"$GLICLASS_TORCH_THREADS\" \
   --model \"$GLICLASS_MODEL\" --device \"$GLICLASS_DEVICE\" \
